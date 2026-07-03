@@ -35,6 +35,32 @@ class Coach:
 		ret = ret[:-2] + '  '
 		return ret
 
+	def makeFlowStatsPrint(self, name, stats, diff_loss, gc_loss):
+		cfm_loss = diff_loss.mean().detach().item()
+		gc_loss_val = gc_loss.mean().detach().item()
+		weighted_gc = gc_loss_val * args.e_loss
+		gc_ratio = weighted_gc / cfm_loss if abs(cfm_loss) > 1e-12 else float('inf')
+		ret = 'Flow Stats %s: cfm = %.6f, gc = %.6f, gc*e_loss = %.6f, gc/cfm = %.6f' % (
+			name,
+			cfm_loss,
+			gc_loss_val,
+			weighted_gc,
+			gc_ratio
+		)
+		for stat_name in ['x_start', 'z_prior', 'x_t', 'v_target', 't', 'delta_norm']:
+			stat = stats[stat_name]
+			ret += ', %s(mean=%.6f,std=%.6f,min=%.6f,max=%.6f)' % (
+				stat_name,
+				stat['mean'],
+				stat['std'],
+				stat['min'],
+				stat['max']
+			)
+		return ret
+
+	def logFlowStats(self, name, stats, diff_loss, gc_loss):
+		log(self.makeFlowStatsPrint(name, stats, diff_loss, gc_loss), save=False)
+
 	def run(self):
 		self.prepareModel()
 		log('Model Prepared')
@@ -155,15 +181,30 @@ class Coach:
 			if args.data == 'tiktok':
 				self.denoise_opt_audio.zero_grad()
 
-			diff_loss_image, gc_loss_image = self.diffusion_model.training_losses(self.denoise_model_image, batch_item, iEmbeds, batch_index, image_feats)
-			diff_loss_text, gc_loss_text = self.diffusion_model.training_losses(self.denoise_model_text, batch_item, iEmbeds, batch_index, text_feats)
+			return_flow_stats = args.debug_flow_stats and i < args.debug_flow_stats_batches
+
+			if return_flow_stats:
+				diff_loss_image, gc_loss_image, flow_stats_image = self.diffusion_model.training_losses(self.denoise_model_image, batch_item, iEmbeds, batch_index, image_feats, return_stats=True)
+				diff_loss_text, gc_loss_text, flow_stats_text = self.diffusion_model.training_losses(self.denoise_model_text, batch_item, iEmbeds, batch_index, text_feats, return_stats=True)
+			else:
+				diff_loss_image, gc_loss_image = self.diffusion_model.training_losses(self.denoise_model_image, batch_item, iEmbeds, batch_index, image_feats)
+				diff_loss_text, gc_loss_text = self.diffusion_model.training_losses(self.denoise_model_text, batch_item, iEmbeds, batch_index, text_feats)
 			if args.data == 'tiktok':
-				diff_loss_audio, gc_loss_audio = self.diffusion_model.training_losses(self.denoise_model_audio, batch_item, iEmbeds, batch_index, audio_feats)
+				if return_flow_stats:
+					diff_loss_audio, gc_loss_audio, flow_stats_audio = self.diffusion_model.training_losses(self.denoise_model_audio, batch_item, iEmbeds, batch_index, audio_feats, return_stats=True)
+				else:
+					diff_loss_audio, gc_loss_audio = self.diffusion_model.training_losses(self.denoise_model_audio, batch_item, iEmbeds, batch_index, audio_feats)
 
 			loss_image = diff_loss_image.mean() + gc_loss_image.mean() * args.e_loss
 			loss_text = diff_loss_text.mean() + gc_loss_text.mean() * args.e_loss
 			if args.data == 'tiktok':
 				loss_audio = diff_loss_audio.mean() + gc_loss_audio.mean() * args.e_loss
+
+			if return_flow_stats:
+				self.logFlowStats('image', flow_stats_image, diff_loss_image, gc_loss_image)
+				self.logFlowStats('text', flow_stats_text, diff_loss_text, gc_loss_text)
+				if args.data == 'tiktok':
+					self.logFlowStats('audio', flow_stats_audio, diff_loss_audio, gc_loss_audio)
 
 			epDiLoss_image += loss_image.item()
 			epDiLoss_text += loss_text.item()

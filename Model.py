@@ -358,7 +358,27 @@ class ConditionalFlowMatching(nn.Module):
 			t = t[..., None]
 		return t * x_start + (1.0 - t) * z_prior
 
-	def training_losses(self, model, x_start, itmEmbeds, batch_index, model_feats):
+	def tensor_stats(self, tensor):
+		tensor = tensor.detach().float()
+		return {
+			'mean': tensor.mean().item(),
+			'std': tensor.std(unbiased=False).item(),
+			'min': tensor.min().item(),
+			'max': tensor.max().item()
+		}
+
+	def flow_stats(self, x_start, z_prior, x_t, v_target, t):
+		delta_norm = v_target.reshape(v_target.shape[0], -1).norm(dim=1)
+		return {
+			'x_start': self.tensor_stats(x_start),
+			'z_prior': self.tensor_stats(z_prior),
+			'x_t': self.tensor_stats(x_t),
+			'v_target': self.tensor_stats(v_target),
+			't': self.tensor_stats(t),
+			'delta_norm': self.tensor_stats(delta_norm)
+		}
+
+	def training_losses(self, model, x_start, itmEmbeds, batch_index, model_feats, return_stats=False):
 		batch_size = x_start.size(0)
 
 		t = torch.rand(batch_size, device=x_start.device)
@@ -379,6 +399,9 @@ class ConditionalFlowMatching(nn.Module):
 		usr_id_embeds = torch.mm(x_start, itmEmbeds)
 
 		gc_loss = self.mean_flat((usr_model_embeds - usr_id_embeds) ** 2)
+
+		if return_stats:
+			return diff_loss, gc_loss, self.flow_stats(x_start, z_prior, x_t, v_target, t)
 
 		return diff_loss, gc_loss
 
