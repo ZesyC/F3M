@@ -274,11 +274,7 @@ class Denoise(nn.Module):
 		self.emb_layer.bias.data.normal_(0.0, 0.001)
 
 	def forward(self, x, timesteps, mess_dropout=True):
-		freqs = torch.exp(-math.log(10000) * torch.arange(start=0, end=self.time_emb_dim//2, dtype=torch.float32) / (self.time_emb_dim//2)).cuda()
-		temp = timesteps[:, None].float() * freqs[None]
-		time_emb = torch.cat([torch.cos(temp), torch.sin(temp)], dim=-1)
-		if self.time_emb_dim % 2:
-			time_emb = torch.cat([time_emb, torch.zeros_like(time_emb[:, :1])], dim=-1)
+		time_emb = self.time_embedding(timesteps)
 		emb = self.emb_layer(time_emb)
 		if self.norm:
 			x = F.normalize(x)
@@ -294,6 +290,20 @@ class Denoise(nn.Module):
 				h = torch.tanh(h)
 
 		return h
+
+	def time_embedding(self, timesteps):
+		num_freqs = self.time_emb_dim // 2
+		freqs = torch.pow(
+			torch.full((num_freqs,), 2.0, dtype=torch.float32, device=timesteps.device),
+			torch.arange(num_freqs, dtype=torch.float32, device=timesteps.device)
+		)
+		angles = 2.0 * math.pi * timesteps[:, None].float() * freqs[None]
+		time_emb = torch.stack([torch.sin(angles), torch.cos(angles)], dim=-1).reshape(timesteps.shape[0], -1)
+		if self.time_emb_dim % 2:
+			extra_freq = torch.pow(torch.tensor(2.0, dtype=torch.float32, device=timesteps.device), num_freqs)
+			extra_emb = torch.sin(2.0 * math.pi * timesteps[:, None].float() * extra_freq)
+			time_emb = torch.cat([time_emb, extra_emb], dim=-1)
+		return time_emb
 
 class ConditionalFlowMatching(nn.Module):
 	def __init__(
@@ -321,8 +331,9 @@ class ConditionalFlowMatching(nn.Module):
 		if item_prior is None:
 			item_prior = torch.empty(0)
 		self.register_buffer('item_prior', item_prior.float())
+		self.register_buffer('prior_scale', torch.tensor(1.0, dtype=torch.float32))
 
-	def make_prior(self, x_start):
+	def make_raw_prior(self, x_start):
 		if self.prior_type == 'gaussian':
 			return torch.randn_like(x_start)
 		if self.prior_type != 'popularity':
@@ -341,6 +352,33 @@ class ConditionalFlowMatching(nn.Module):
 			z_prior = (1.0 - self.prior_mix) * z_prior + self.prior_mix * user_prior
 
 		return z_prior
+
+	def calibrate_prior_scale(self, loader, device, max_batches=None):
+		x_norm_sum = 0.0
+		z_norm_sum = 0.0
+		num_samples = 0
+
+		with torch.no_grad():
+			for batch_id, batch in enumerate(loader):
+				if max_batches is not None and batch_id >= max_batches:
+					break
+				x_start = batch[0].to(device)
+				z_prior = self.make_raw_prior(x_start)
+				x_norm = x_start.reshape(x_start.shape[0], -1).norm(dim=1)
+				z_norm = z_prior.reshape(z_prior.shape[0], -1).norm(dim=1)
+				x_norm_sum += x_norm.sum().item()
+				z_norm_sum += z_norm.sum().item()
+				num_samples += x_start.shape[0]
+
+		if num_samples == 0 or z_norm_sum <= 1e-12:
+			scale_factor = 1.0
+		else:
+			scale_factor = (x_norm_sum / num_samples) / max(z_norm_sum / num_samples, 1e-12)
+		self.prior_scale.fill_(float(scale_factor))
+		return float(scale_factor)
+
+	def make_prior(self, x_start):
+		return self.make_raw_prior(x_start) * self.prior_scale.to(device=x_start.device, dtype=x_start.dtype)
 
 	def dropout_user_history(self, x_start):
 		if self.prior_dropout <= 0:
@@ -369,16 +407,20 @@ class ConditionalFlowMatching(nn.Module):
 
 	def flow_stats(self, x_start, z_prior, x_t, v_target, t):
 		delta_norm = v_target.reshape(v_target.shape[0], -1).norm(dim=1)
+		x_norm = x_start.reshape(x_start.shape[0], -1).norm(dim=1)
+		z_norm = z_prior.reshape(z_prior.shape[0], -1).norm(dim=1)
 		return {
 			'x_start': self.tensor_stats(x_start),
 			'z_prior': self.tensor_stats(z_prior),
 			'x_t': self.tensor_stats(x_t),
 			'v_target': self.tensor_stats(v_target),
 			't': self.tensor_stats(t),
-			'delta_norm': self.tensor_stats(delta_norm)
+			'delta_norm': self.tensor_stats(delta_norm),
+			'x_norm': self.tensor_stats(x_norm),
+			'z_norm': self.tensor_stats(z_norm)
 		}
 
-	def training_losses(self, model, x_start, itmEmbeds, batch_index, model_feats, return_stats=False):
+	def training_losses(self, model, x_start, itmEmbeds, batch_index, model_feats, return_stats=False, return_t=False):
 		batch_size = x_start.size(0)
 
 		t = torch.rand(batch_size, device=x_start.device)
@@ -401,7 +443,12 @@ class ConditionalFlowMatching(nn.Module):
 		gc_loss = self.mean_flat((usr_model_embeds - usr_id_embeds) ** 2)
 
 		if return_stats:
+			if return_t:
+				return diff_loss, gc_loss, self.flow_stats(x_start, z_prior, x_t, v_target, t), t
 			return diff_loss, gc_loss, self.flow_stats(x_start, z_prior, x_t, v_target, t)
+
+		if return_t:
+			return diff_loss, gc_loss, t
 
 		return diff_loss, gc_loss
 

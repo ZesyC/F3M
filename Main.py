@@ -15,6 +15,8 @@ from scipy.sparse import coo_matrix
 class Coach:
 	def __init__(self, handler):
 		self.handler = handler
+		self.t_buckets = [(0.0, 0.2), (0.2, 0.4), (0.4, 0.6), (0.6, 0.8), (0.8, 1.0)]
+		self.prev_bucket_summary = dict()
 
 		print('USER', args.user, 'ITEM', args.item)
 		print('NUM OF INTERACTIONS', self.handler.trnLoader.dataset.__len__())
@@ -61,9 +63,141 @@ class Coach:
 	def logFlowStats(self, name, stats, diff_loss, gc_loss):
 		log(self.makeFlowStatsPrint(name, stats, diff_loss, gc_loss), save=False)
 
+	def logPriorNormStats(self, name, stats, step):
+		x_norm = stats['x_norm']['mean']
+		z_norm = stats['z_norm']['mean']
+		ratio = x_norm / max(z_norm, 1e-12)
+		log('[x1 vs z_prior norm] %s step %d: x1_norm_mean=%.6f, z_prior_norm_mean=%.6f, ratio=%.6f' % (
+			name,
+			step,
+			x_norm,
+			z_norm,
+			ratio
+		), save=False)
+
+	def initBucketStats(self):
+		stats = dict()
+		for bucket in self.t_buckets:
+			stats[bucket] = {
+				'diff_sum': 0.0,
+				'diff_sq_sum': 0.0,
+				'gc_sum': 0.0,
+				'gc_sq_sum': 0.0,
+				'n': 0
+			}
+		return stats
+
+	def updateBucketStats(self, bucket_stats, t, diff_loss, gc_loss):
+		t = t.detach()
+		diff_loss = diff_loss.detach()
+		gc_loss = gc_loss.detach()
+		for start, end in self.t_buckets:
+			if end == 1.0:
+				mask = (t >= start) & (t <= end)
+			else:
+				mask = (t >= start) & (t < end)
+			n = mask.sum().item()
+			if n == 0:
+				continue
+			diff_bucket = diff_loss[mask].float()
+			gc_bucket = gc_loss[mask].float()
+			stat = bucket_stats[(start, end)]
+			stat['diff_sum'] += diff_bucket.sum().item()
+			stat['diff_sq_sum'] += (diff_bucket * diff_bucket).sum().item()
+			stat['gc_sum'] += gc_bucket.sum().item()
+			stat['gc_sq_sum'] += (gc_bucket * gc_bucket).sum().item()
+			stat['n'] += n
+
+	def summarizeBucketStats(self, bucket_stats):
+		summary = dict()
+		for bucket, stat in bucket_stats.items():
+			n = stat['n']
+			if n == 0:
+				summary[bucket] = None
+				continue
+			diff_mean = stat['diff_sum'] / n
+			gc_mean = stat['gc_sum'] / n
+			diff_var = max(stat['diff_sq_sum'] / n - diff_mean * diff_mean, 0.0)
+			gc_var = max(stat['gc_sq_sum'] / n - gc_mean * gc_mean, 0.0)
+			summary[bucket] = {
+				'n': n,
+				'diff_mean': diff_mean,
+				'diff_std': diff_var ** 0.5,
+				'gc_mean': gc_mean,
+				'gc_std': gc_var ** 0.5,
+				'ratio': gc_mean / max(diff_mean, 1e-12)
+			}
+		return summary
+
+	def logBucketStats(self, epoch, name, bucket_stats):
+		summary = self.summarizeBucketStats(bucket_stats)
+		prev_summary = self.prev_bucket_summary.get(name)
+		log('[diff_loss vs gc_loss by t bucket] %s' % name, save=False)
+		for start, end in self.t_buckets:
+			stat = summary[(start, end)]
+			if stat is None:
+				log('Epoch %d | t in [%.1f,%.1f]: empty' % (epoch, start, end), save=False)
+				continue
+			if prev_summary is not None and prev_summary.get((start, end)) is not None:
+				prev = prev_summary[(start, end)]
+				diff_delta = stat['diff_mean'] - prev['diff_mean']
+				gc_delta = stat['gc_mean'] - prev['gc_mean']
+			else:
+				diff_delta = 0.0
+				gc_delta = 0.0
+			log(
+				'Epoch %d | t in [%.1f,%.1f]: n=%d, '
+				'diff_loss(mean=%.8f,std=%.8f), '
+				'gc_loss(mean=%.8f,std=%.8f), '
+				'gc/diff=%.8f, '
+				'delta_vs_prev(diff=%.8f,gc=%.8f)' % (
+					epoch,
+					start,
+					end,
+					stat['n'],
+					stat['diff_mean'],
+					stat['diff_std'],
+					stat['gc_mean'],
+					stat['gc_std'],
+					stat['ratio'],
+					diff_delta,
+					gc_delta
+				),
+				save=False
+			)
+		self.prev_bucket_summary[name] = summary
+
+	def logTimeEmbeddingDebug(self):
+		t = torch.tensor([0.1, 0.3, 0.5, 0.7, 0.9], device=self.diffusion_model.item_prior.device)
+		scaled_t = self.diffusion_model.scale_time(t)
+		time_emb = self.denoise_model_image.time_embedding(scaled_t).detach().cpu()
+		scaled_t_cpu = scaled_t.detach().cpu()
+		log('Time embedding debug: flow_time_scale = %.6f' % args.flow_time_scale, save=False)
+		for idx in range(t.shape[0]):
+			values = ', '.join(['%.6f' % val for val in time_emb[idx].tolist()])
+			log('t = %.1f, scale_time(t) = %.6f, time_emb = [%s]' % (
+				t[idx].item(),
+				scaled_t_cpu[idx].item(),
+				values
+			), save=False)
+		for idx in range(1, time_emb.shape[0]):
+			diff = (time_emb[idx] - time_emb[idx - 1]).abs()
+			values = ', '.join(['%.6f' % val for val in diff.tolist()])
+			log('abs diff t %.1f -> %.1f: mean = %.8f, min = %.8f, max = %.8f, diff = [%s]' % (
+				t[idx - 1].item(),
+				t[idx].item(),
+				diff.mean().item(),
+				diff.min().item(),
+				diff.max().item(),
+				values
+			), save=False)
+
 	def run(self):
 		self.prepareModel()
 		log('Model Prepared')
+		if args.debug_time_embedding:
+			self.logTimeEmbeddingDebug()
+			return
 
 		recallMax = 0
 		ndcgMax = 0
@@ -74,7 +208,7 @@ class Coach:
 
 		for ep in range(0, args.epoch):
 			tstFlag = (ep % args.tstEpoch == 0)
-			reses = self.trainEpoch()
+			reses = self.trainEpoch(ep)
 			log(self.makePrint('Train', ep, reses, tstFlag))
 			if tstFlag:
 				reses = self.testEpoch()
@@ -103,6 +237,11 @@ class Coach:
 			prior_dropout=args.cf_prior_dropout,
 			time_scale=args.flow_time_scale
 		).cuda()
+		prior_scale = self.diffusion_model.calibrate_prior_scale(
+			self.handler.diffusionLoader,
+			self.diffusion_model.item_prior.device
+		)
+		log('CFM prior_scale calibrated on train diffusion loader: %.6f' % prior_scale, save=False)
 		
 		out_dims = eval(args.dims) + [args.item]
 		in_dims = out_dims[::-1]
@@ -148,7 +287,7 @@ class Coach:
 
 		return torch.sparse.FloatTensor(idxs, vals, shape).cuda()
 
-	def trainEpoch(self):
+	def trainEpoch(self, epoch):
 		trnLoader = self.handler.trnLoader
 		trnLoader.dataset.negSampling()
 		epLoss, epRecLoss, epClLoss = 0, 0, 0
@@ -163,6 +302,10 @@ class Coach:
 
 		diffusionLoader = self.handler.diffusionLoader
 		diff_steps = max(len(diffusionLoader), 1)
+		bucket_stats_image = self.initBucketStats()
+		bucket_stats_text = self.initBucketStats()
+		if args.data == 'tiktok':
+			bucket_stats_audio = self.initBucketStats()
 
 		for i, batch in enumerate(diffusionLoader):
 			batch_item, batch_index = batch
@@ -182,18 +325,25 @@ class Coach:
 				self.denoise_opt_audio.zero_grad()
 
 			return_flow_stats = args.debug_flow_stats and i < args.debug_flow_stats_batches
+			return_norm_stats = i < 1000 and i % 200 == 0
+			return_stats = return_flow_stats or return_norm_stats
 
-			if return_flow_stats:
-				diff_loss_image, gc_loss_image, flow_stats_image = self.diffusion_model.training_losses(self.denoise_model_image, batch_item, iEmbeds, batch_index, image_feats, return_stats=True)
-				diff_loss_text, gc_loss_text, flow_stats_text = self.diffusion_model.training_losses(self.denoise_model_text, batch_item, iEmbeds, batch_index, text_feats, return_stats=True)
+			if return_stats:
+				diff_loss_image, gc_loss_image, flow_stats_image, t_image = self.diffusion_model.training_losses(self.denoise_model_image, batch_item, iEmbeds, batch_index, image_feats, return_stats=True, return_t=True)
+				diff_loss_text, gc_loss_text, flow_stats_text, t_text = self.diffusion_model.training_losses(self.denoise_model_text, batch_item, iEmbeds, batch_index, text_feats, return_stats=True, return_t=True)
 			else:
-				diff_loss_image, gc_loss_image = self.diffusion_model.training_losses(self.denoise_model_image, batch_item, iEmbeds, batch_index, image_feats)
-				diff_loss_text, gc_loss_text = self.diffusion_model.training_losses(self.denoise_model_text, batch_item, iEmbeds, batch_index, text_feats)
+				diff_loss_image, gc_loss_image, t_image = self.diffusion_model.training_losses(self.denoise_model_image, batch_item, iEmbeds, batch_index, image_feats, return_t=True)
+				diff_loss_text, gc_loss_text, t_text = self.diffusion_model.training_losses(self.denoise_model_text, batch_item, iEmbeds, batch_index, text_feats, return_t=True)
 			if args.data == 'tiktok':
-				if return_flow_stats:
-					diff_loss_audio, gc_loss_audio, flow_stats_audio = self.diffusion_model.training_losses(self.denoise_model_audio, batch_item, iEmbeds, batch_index, audio_feats, return_stats=True)
+				if return_stats:
+					diff_loss_audio, gc_loss_audio, flow_stats_audio, t_audio = self.diffusion_model.training_losses(self.denoise_model_audio, batch_item, iEmbeds, batch_index, audio_feats, return_stats=True, return_t=True)
 				else:
-					diff_loss_audio, gc_loss_audio = self.diffusion_model.training_losses(self.denoise_model_audio, batch_item, iEmbeds, batch_index, audio_feats)
+					diff_loss_audio, gc_loss_audio, t_audio = self.diffusion_model.training_losses(self.denoise_model_audio, batch_item, iEmbeds, batch_index, audio_feats, return_t=True)
+
+			self.updateBucketStats(bucket_stats_image, t_image, diff_loss_image, gc_loss_image)
+			self.updateBucketStats(bucket_stats_text, t_text, diff_loss_text, gc_loss_text)
+			if args.data == 'tiktok':
+				self.updateBucketStats(bucket_stats_audio, t_audio, diff_loss_audio, gc_loss_audio)
 
 			loss_image = diff_loss_image.mean() + gc_loss_image.mean() * args.e_loss
 			loss_text = diff_loss_text.mean() + gc_loss_text.mean() * args.e_loss
@@ -205,6 +355,11 @@ class Coach:
 				self.logFlowStats('text', flow_stats_text, diff_loss_text, gc_loss_text)
 				if args.data == 'tiktok':
 					self.logFlowStats('audio', flow_stats_audio, diff_loss_audio, gc_loss_audio)
+			if return_norm_stats:
+				self.logPriorNormStats('image', flow_stats_image, i)
+				self.logPriorNormStats('text', flow_stats_text, i)
+				if args.data == 'tiktok':
+					self.logPriorNormStats('audio', flow_stats_audio, i)
 
 			epDiLoss_image += loss_image.item()
 			epDiLoss_text += loss_text.item()
@@ -232,6 +387,10 @@ class Coach:
 			log('Diffusion Step %d/%d' % (i, diff_steps), save=False, oneline=True)
 
 		log('')
+		self.logBucketStats(epoch, 'image', bucket_stats_image)
+		self.logBucketStats(epoch, 'text', bucket_stats_text)
+		if args.data == 'tiktok':
+			self.logBucketStats(epoch, 'audio', bucket_stats_audio)
 		log('Start to re-build UI matrix')
 
 		with torch.no_grad():

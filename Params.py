@@ -34,6 +34,7 @@ def ParseArgs():
 	parser.add_argument('--flow_time_scale', type=float, default=1.0)
 	parser.add_argument('--debug_flow_stats', action='store_true')
 	parser.add_argument('--debug_flow_stats_batches', type=int, default=1)
+	parser.add_argument('--debug_time_embedding', action='store_true')
 
 	parser.add_argument('--rebuild_k', type=int, default=1)
 	parser.add_argument('--e_loss', type=float, default=0.1)
