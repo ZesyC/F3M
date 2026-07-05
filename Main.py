@@ -17,6 +17,10 @@ class Coach:
 		self.handler = handler
 		self.t_buckets = [(0.0, 0.2), (0.2, 0.4), (0.4, 0.6), (0.6, 0.8), (0.8, 1.0)]
 		self.prev_bucket_summary = dict()
+		self.gc_scale_ema_image = None
+		self.gc_scale_ema_text = None
+		self.gc_scale_ema_audio = None
+		self.ema_decay = 0.99
 
 		print('USER', args.user, 'ITEM', args.item)
 		print('NUM OF INTERACTIONS', self.handler.trnLoader.dataset.__len__())
@@ -37,15 +41,20 @@ class Coach:
 		ret = ret[:-2] + '  '
 		return ret
 
-	def makeFlowStatsPrint(self, name, stats, diff_loss, gc_loss):
+	def makeFlowStatsPrint(self, name, stats, diff_loss, gc_loss, gc_scale_ema=None):
 		cfm_loss = diff_loss.mean().detach().item()
 		gc_loss_val = gc_loss.mean().detach().item()
-		weighted_gc = gc_loss_val * args.e_loss
+		if gc_scale_ema is None:
+			gc_scale_val = 1.0
+		else:
+			gc_scale_val = gc_scale_ema.detach().item()
+		weighted_gc = gc_loss_val * gc_scale_val * args.e_loss
 		gc_ratio = weighted_gc / cfm_loss if abs(cfm_loss) > 1e-12 else float('inf')
-		ret = 'Flow Stats %s: cfm = %.6f, gc = %.6f, gc*e_loss = %.6f, gc/cfm = %.6f' % (
+		ret = 'Flow Stats %s: cfm = %.6f, gc = %.6f, gc_scale_ema = %.10f, gc_scaled*e_loss = %.6f, gc_scaled*e/cfm = %.6f' % (
 			name,
 			cfm_loss,
 			gc_loss_val,
+			gc_scale_val,
 			weighted_gc,
 			gc_ratio
 		)
@@ -60,8 +69,41 @@ class Coach:
 			)
 		return ret
 
-	def logFlowStats(self, name, stats, diff_loss, gc_loss):
-		log(self.makeFlowStatsPrint(name, stats, diff_loss, gc_loss), save=False)
+	def logFlowStats(self, name, stats, diff_loss, gc_loss, gc_scale_ema=None):
+		log(self.makeFlowStatsPrint(name, stats, diff_loss, gc_loss, gc_scale_ema), save=False)
+
+	def combineFlowLoss(self, name, diff_loss, gc_loss):
+		diff_mean = diff_loss.mean()
+		gc_mean = gc_loss.mean()
+		scale_attr = 'gc_scale_ema_%s' % name
+		with torch.no_grad():
+			ratio = diff_mean.detach() / (gc_mean.detach() + 1e-8)
+			gc_scale_ema = getattr(self, scale_attr)
+			if gc_scale_ema is None:
+				gc_scale_ema = ratio
+			else:
+				gc_scale_ema = (
+					self.ema_decay * gc_scale_ema.to(device=ratio.device, dtype=ratio.dtype)
+					+ (1.0 - self.ema_decay) * ratio
+				)
+			setattr(self, scale_attr, gc_scale_ema.detach())
+
+		gc_scale = getattr(self, scale_attr).to(device=gc_mean.device, dtype=gc_mean.dtype)
+		gc_loss_scaled = gc_mean * gc_scale
+		weighted_gc_scaled = gc_loss_scaled * args.e_loss
+		return diff_mean + weighted_gc_scaled, gc_loss_scaled.detach(), weighted_gc_scaled.detach()
+
+	def logGcScaleStats(self, epoch, name, gc_scale_ema, diff_loss, weighted_gc_scaled):
+		gc_scale_val = gc_scale_ema.detach().item() if gc_scale_ema is not None else 1.0
+		ratio = weighted_gc_scaled / max(diff_loss, 1e-12)
+		log('[gc_loss scale EMA] Epoch %d | %s: gc_scale_ema=%.10f, diff_loss=%.8f, gc_scaled*e_loss=%.8f, gc_scaled*e/diff=%.8f' % (
+			epoch,
+			name,
+			gc_scale_val,
+			diff_loss,
+			weighted_gc_scaled,
+			ratio
+		), save=False)
 
 	def logPriorNormStats(self, name, stats, step):
 		x_norm = stats['x_norm']['mean']
@@ -83,14 +125,17 @@ class Coach:
 				'diff_sq_sum': 0.0,
 				'gc_sum': 0.0,
 				'gc_sq_sum': 0.0,
+				'v_norm_sum': 0.0,
+				'v_norm_sq_sum': 0.0,
 				'n': 0
 			}
 		return stats
 
-	def updateBucketStats(self, bucket_stats, t, diff_loss, gc_loss):
+	def updateBucketStats(self, bucket_stats, t, diff_loss, gc_loss, v_pred_norm):
 		t = t.detach()
 		diff_loss = diff_loss.detach()
 		gc_loss = gc_loss.detach()
+		v_pred_norm = v_pred_norm.detach()
 		for start, end in self.t_buckets:
 			if end == 1.0:
 				mask = (t >= start) & (t <= end)
@@ -101,11 +146,14 @@ class Coach:
 				continue
 			diff_bucket = diff_loss[mask].float()
 			gc_bucket = gc_loss[mask].float()
+			v_norm_bucket = v_pred_norm[mask].float()
 			stat = bucket_stats[(start, end)]
 			stat['diff_sum'] += diff_bucket.sum().item()
 			stat['diff_sq_sum'] += (diff_bucket * diff_bucket).sum().item()
 			stat['gc_sum'] += gc_bucket.sum().item()
 			stat['gc_sq_sum'] += (gc_bucket * gc_bucket).sum().item()
+			stat['v_norm_sum'] += v_norm_bucket.sum().item()
+			stat['v_norm_sq_sum'] += (v_norm_bucket * v_norm_bucket).sum().item()
 			stat['n'] += n
 
 	def summarizeBucketStats(self, bucket_stats):
@@ -117,14 +165,18 @@ class Coach:
 				continue
 			diff_mean = stat['diff_sum'] / n
 			gc_mean = stat['gc_sum'] / n
+			v_norm_mean = stat['v_norm_sum'] / n
 			diff_var = max(stat['diff_sq_sum'] / n - diff_mean * diff_mean, 0.0)
 			gc_var = max(stat['gc_sq_sum'] / n - gc_mean * gc_mean, 0.0)
+			v_norm_var = max(stat['v_norm_sq_sum'] / n - v_norm_mean * v_norm_mean, 0.0)
 			summary[bucket] = {
 				'n': n,
 				'diff_mean': diff_mean,
 				'diff_std': diff_var ** 0.5,
 				'gc_mean': gc_mean,
 				'gc_std': gc_var ** 0.5,
+				'v_norm_mean': v_norm_mean,
+				'v_norm_std': v_norm_var ** 0.5,
 				'ratio': gc_mean / max(diff_mean, 1e-12)
 			}
 		return summary
@@ -150,6 +202,7 @@ class Coach:
 				'diff_loss(mean=%.8f,std=%.8f), '
 				'gc_loss(mean=%.8f,std=%.8f), '
 				'gc/diff=%.8f, '
+				'v_pred_norm(mean=%.8f,std=%.8f), '
 				'delta_vs_prev(diff=%.8f,gc=%.8f)' % (
 					epoch,
 					start,
@@ -160,6 +213,8 @@ class Coach:
 					stat['gc_mean'],
 					stat['gc_std'],
 					stat['ratio'],
+					stat['v_norm_mean'],
+					stat['v_norm_std'],
 					diff_delta,
 					gc_delta
 				),
@@ -295,9 +350,11 @@ class Coach:
 		epDiLoss_image, epDiLoss_text = 0, 0
 		epCfmLoss_image, epCfmLoss_text = 0, 0
 		epGcLoss_image, epGcLoss_text = 0, 0
+		epWeightedScaledGcLoss_image, epWeightedScaledGcLoss_text = 0, 0
 		if args.data == 'tiktok':
 			epDiLoss_audio = 0
 			epCfmLoss_audio, epGcLoss_audio = 0, 0
+			epWeightedScaledGcLoss_audio = 0
 		steps = trnLoader.dataset.__len__() // args.batch
 
 		diffusionLoader = self.handler.diffusionLoader
@@ -329,32 +386,32 @@ class Coach:
 			return_stats = return_flow_stats or return_norm_stats
 
 			if return_stats:
-				diff_loss_image, gc_loss_image, flow_stats_image, t_image = self.diffusion_model.training_losses(self.denoise_model_image, batch_item, iEmbeds, batch_index, image_feats, return_stats=True, return_t=True)
-				diff_loss_text, gc_loss_text, flow_stats_text, t_text = self.diffusion_model.training_losses(self.denoise_model_text, batch_item, iEmbeds, batch_index, text_feats, return_stats=True, return_t=True)
+				diff_loss_image, gc_loss_image, flow_stats_image, t_image, v_pred_norm_image = self.diffusion_model.training_losses(self.denoise_model_image, batch_item, iEmbeds, batch_index, image_feats, return_stats=True, return_t=True, return_v_norm=True)
+				diff_loss_text, gc_loss_text, flow_stats_text, t_text, v_pred_norm_text = self.diffusion_model.training_losses(self.denoise_model_text, batch_item, iEmbeds, batch_index, text_feats, return_stats=True, return_t=True, return_v_norm=True)
 			else:
-				diff_loss_image, gc_loss_image, t_image = self.diffusion_model.training_losses(self.denoise_model_image, batch_item, iEmbeds, batch_index, image_feats, return_t=True)
-				diff_loss_text, gc_loss_text, t_text = self.diffusion_model.training_losses(self.denoise_model_text, batch_item, iEmbeds, batch_index, text_feats, return_t=True)
+				diff_loss_image, gc_loss_image, t_image, v_pred_norm_image = self.diffusion_model.training_losses(self.denoise_model_image, batch_item, iEmbeds, batch_index, image_feats, return_t=True, return_v_norm=True)
+				diff_loss_text, gc_loss_text, t_text, v_pred_norm_text = self.diffusion_model.training_losses(self.denoise_model_text, batch_item, iEmbeds, batch_index, text_feats, return_t=True, return_v_norm=True)
 			if args.data == 'tiktok':
 				if return_stats:
-					diff_loss_audio, gc_loss_audio, flow_stats_audio, t_audio = self.diffusion_model.training_losses(self.denoise_model_audio, batch_item, iEmbeds, batch_index, audio_feats, return_stats=True, return_t=True)
+					diff_loss_audio, gc_loss_audio, flow_stats_audio, t_audio, v_pred_norm_audio = self.diffusion_model.training_losses(self.denoise_model_audio, batch_item, iEmbeds, batch_index, audio_feats, return_stats=True, return_t=True, return_v_norm=True)
 				else:
-					diff_loss_audio, gc_loss_audio, t_audio = self.diffusion_model.training_losses(self.denoise_model_audio, batch_item, iEmbeds, batch_index, audio_feats, return_t=True)
+					diff_loss_audio, gc_loss_audio, t_audio, v_pred_norm_audio = self.diffusion_model.training_losses(self.denoise_model_audio, batch_item, iEmbeds, batch_index, audio_feats, return_t=True, return_v_norm=True)
 
-			self.updateBucketStats(bucket_stats_image, t_image, diff_loss_image, gc_loss_image)
-			self.updateBucketStats(bucket_stats_text, t_text, diff_loss_text, gc_loss_text)
+			self.updateBucketStats(bucket_stats_image, t_image, diff_loss_image, gc_loss_image, v_pred_norm_image)
+			self.updateBucketStats(bucket_stats_text, t_text, diff_loss_text, gc_loss_text, v_pred_norm_text)
 			if args.data == 'tiktok':
-				self.updateBucketStats(bucket_stats_audio, t_audio, diff_loss_audio, gc_loss_audio)
+				self.updateBucketStats(bucket_stats_audio, t_audio, diff_loss_audio, gc_loss_audio, v_pred_norm_audio)
 
-			loss_image = diff_loss_image.mean() + gc_loss_image.mean() * args.e_loss
-			loss_text = diff_loss_text.mean() + gc_loss_text.mean() * args.e_loss
+			loss_image, _, weighted_gc_scaled_image = self.combineFlowLoss('image', diff_loss_image, gc_loss_image)
+			loss_text, _, weighted_gc_scaled_text = self.combineFlowLoss('text', diff_loss_text, gc_loss_text)
 			if args.data == 'tiktok':
-				loss_audio = diff_loss_audio.mean() + gc_loss_audio.mean() * args.e_loss
+				loss_audio, _, weighted_gc_scaled_audio = self.combineFlowLoss('audio', diff_loss_audio, gc_loss_audio)
 
 			if return_flow_stats:
-				self.logFlowStats('image', flow_stats_image, diff_loss_image, gc_loss_image)
-				self.logFlowStats('text', flow_stats_text, diff_loss_text, gc_loss_text)
+				self.logFlowStats('image', flow_stats_image, diff_loss_image, gc_loss_image, self.gc_scale_ema_image)
+				self.logFlowStats('text', flow_stats_text, diff_loss_text, gc_loss_text, self.gc_scale_ema_text)
 				if args.data == 'tiktok':
-					self.logFlowStats('audio', flow_stats_audio, diff_loss_audio, gc_loss_audio)
+					self.logFlowStats('audio', flow_stats_audio, diff_loss_audio, gc_loss_audio, self.gc_scale_ema_audio)
 			if return_norm_stats:
 				self.logPriorNormStats('image', flow_stats_image, i)
 				self.logPriorNormStats('text', flow_stats_text, i)
@@ -367,10 +424,13 @@ class Coach:
 			epCfmLoss_text += diff_loss_text.mean().item()
 			epGcLoss_image += gc_loss_image.mean().item()
 			epGcLoss_text += gc_loss_text.mean().item()
+			epWeightedScaledGcLoss_image += weighted_gc_scaled_image.item()
+			epWeightedScaledGcLoss_text += weighted_gc_scaled_text.item()
 			if args.data == 'tiktok':
 				epDiLoss_audio += loss_audio.item()
 				epCfmLoss_audio += diff_loss_audio.mean().item()
 				epGcLoss_audio += gc_loss_audio.mean().item()
+				epWeightedScaledGcLoss_audio += weighted_gc_scaled_audio.item()
 
 			if args.data == 'tiktok':
 				loss = loss_image + loss_text + loss_audio
@@ -391,6 +451,10 @@ class Coach:
 		self.logBucketStats(epoch, 'text', bucket_stats_text)
 		if args.data == 'tiktok':
 			self.logBucketStats(epoch, 'audio', bucket_stats_audio)
+		self.logGcScaleStats(epoch, 'image', self.gc_scale_ema_image, epCfmLoss_image / diff_steps, epWeightedScaledGcLoss_image / diff_steps)
+		self.logGcScaleStats(epoch, 'text', self.gc_scale_ema_text, epCfmLoss_text / diff_steps, epWeightedScaledGcLoss_text / diff_steps)
+		if args.data == 'tiktok':
+			self.logGcScaleStats(epoch, 'audio', self.gc_scale_ema_audio, epCfmLoss_audio / diff_steps, epWeightedScaledGcLoss_audio / diff_steps)
 		log('Start to re-build UI matrix')
 
 		with torch.no_grad():
@@ -537,10 +601,13 @@ class Coach:
 		ret['CFM text loss'] = epCfmLoss_text / diff_steps
 		ret['GC image loss'] = epGcLoss_image / diff_steps
 		ret['GC text loss'] = epGcLoss_text / diff_steps
+		ret['GC image scaled*e_loss'] = epWeightedScaledGcLoss_image / diff_steps
+		ret['GC text scaled*e_loss'] = epWeightedScaledGcLoss_text / diff_steps
 		if args.data == 'tiktok':
 			ret['Di audio loss'] = epDiLoss_audio / diff_steps
 			ret['CFM audio loss'] = epCfmLoss_audio / diff_steps
 			ret['GC audio loss'] = epGcLoss_audio / diff_steps
+			ret['GC audio scaled*e_loss'] = epWeightedScaledGcLoss_audio / diff_steps
 		return ret
 
 	def testEpoch(self):

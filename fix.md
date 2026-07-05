@@ -1,116 +1,120 @@
-CONTEXT: Codebase CFM-based multimodal recommendation (fork từ DiffMM), dùng conditional 
-flow matching thay cho diffusion. Cần sửa 2 bug và thêm logging cho 1 diagnostic.
+CONTEXT: Codebase CFM-based multimodal recommendation (fork từ DiffMM). Log training 
+thật (baby dataset, 44 epoch) cho thấy: gc_loss có magnitude lớn hơn diff_loss khoảng 
+1000-8000 lần (ví dụ epoch 0: diff_loss≈0.0015, gc_loss≈187-458). Dù e_loss=0.01 được 
+dùng để hạ trọng số gc_loss, gc_loss*e_loss vẫn áp đảo hoàn toàn diff_loss trong tổng 
+loss (Di image loss = diff_loss + e_loss*gc_loss ≈ gần như bằng e_loss*gc_loss). 
+Hệ quả quan sát được: diff_loss gần như không giảm qua 44 epoch (0.00157→0.00142, 
+~10%), trong khi gc_loss giảm mạnh (458→7, ~98%) — network chủ yếu học để tối thiểu 
+gc_loss, KHÔNG học velocity field đúng nghĩa. Ngoài ra, bucket t∈[0.8,1.0] có gc_loss 
+CAO NHẤT trong mọi epoch — bất thường vì hệ số (1-t) nhân với v_pred trong công thức 
+reconstruct x_hat1 = x_t + (1-t)*v_pred lẽ ra phải làm gc_loss tại t→1 tiệm cận 0 một 
+cách cơ học. Nghi ngờ: v_pred có magnitude bùng nổ ở vùng t gần 1 để bù lại hệ số 
+(1-t) nhỏ, do thiếu gradient signal hiệu quả ở vùng này.
 
 =====================================================================
-TASK 1: Fix time embedding — sai tần số cho t liên tục trong [0,1]
+TASK 4: Chuẩn hoá scale giữa diff_loss và gc_loss trước khi combine
 =====================================================================
 
 VẤN ĐỀ:
-Hàm `scale_time(t)` và sinusoidal time embedding hiện tại được kế thừa từ code 
-diffusion gốc, nơi timestep là số nguyên chạy 0→1000. Bây giờ t ~ U(0,1) liên tục 
-nhưng tần số sinusoid không được điều chỉnh lại, khiến 8/10 chiều embedding gần 
-như đóng băng (thay đổi <0.15 trên toàn range t=0→1), chỉ 1 cặp (sin,cos) tần số 
-thấp nhất là thực sự biến thiên — network gần như "mù" phần lớn thông tin t.
+Hai loss có nguồn gốc khác nhau về mặt số học: diff_loss là MSE trên velocity 
+(kích thước item_dim), gc_loss là MSE trên embedding sau khi nhân với ma trận 
+feature/embedding lớn (usr_model_embeds, usr_id_embeds) — magnitude tự nhiên 
+lớn hơn nhiều bậc. Hệ số e_loss cố định (0.01) không đủ để cân bằng vì nó không 
+thích ứng với sự thay đổi magnitude qua các epoch.
 
 YÊU CẦU SỬA:
-1. Tìm hàm sinh time embedding (search "scale_time" và nơi gọi sinusoidal 
-   positional/time embedding trong flow model).
-2. Thay tần số hiện tại (được calibrate cho t nguyên 0-1000) bằng tần số phù hợp 
-   range [0,1] liên tục. Dùng công thức chuẩn:
-   
-   freq_i = 2^i  (i = 0, 1, ..., num_freqs-1)
-   emb = concat([sin(2*pi*freq_i*t), cos(2*pi*freq_i*t)] for i in range(num_freqs))
-   
-   (tương đương NeRF-style Fourier features, phù hợp cho input scalar trong [0,1])
-3. Đảm bảo num_freqs đủ để tần số cao nhất quét được ít nhất 2-3 chu kỳ đầy đủ 
-   trong [0,1] (tức freq cao nhất ~ 4-8), còn tần số thấp nhất vẫn có độ phân giải 
-   mượt ở gần t=0 và t=1.
-4. KHÔNG thay đổi output dimension của embedding (để không phải sửa lại các layer 
-   downstream ăn embedding này) — chỉ thay công thức tính tần số bên trong.
+1. Tìm đoạn code combine loss hiện tại (nơi có `diff_loss_image.mean() + 
+   gc_loss_image.mean() * args.e_loss`, tương tự cho text và audio nếu tiktok).
 
-VERIFY SAU KHI SỬA:
-Chạy lại đúng script debug_time_embedding.py (hoặc viết lại tương đương) với 
-t = [0.1, 0.3, 0.5, 0.7, 0.9], in toàn bộ các chiều embedding + abs diff giữa 
-các t liên tiếp. Tiêu chí đạt: KHÔNG có chiều nào có abs diff <0.05 giữa mọi 
-cặp t liên tiếp (tức là mọi chiều đều biến thiên rõ rệt, không còn chiều "đóng băng").
+2. Thêm cơ chế normalize gc_loss về cùng bậc độ lớn với diff_loss TRƯỚC khi 
+   nhân e_loss, dùng EMA (exponential moving average) của tỷ lệ giữa hai loss, 
+   theo pattern sau (áp dụng riêng cho từng modality: image, text, và audio 
+   nếu có):
 
-=====================================================================
-TASK 2: Fix scale mismatch giữa x1 (x_start) và z_prior
-=====================================================================
+   # Khởi tạo (một lần, ngoài vòng lặp training) — ví dụ trong __init__ của 
+   # model hoặc như biến global/buffer:
+   self.gc_scale_ema_image = None
+   self.gc_scale_ema_text = None
+   self.ema_decay = 0.99
 
-VẤN ĐỀ:
-x1.norm().mean() ≈ 2.44, z_prior.norm().mean() ≈ 0.92 → lệch nhau ~2.6 lần. 
-Vì x_t = t*x1 + (1-t)*z_prior, lệch scale này làm méo quỹ đạo nội suy — 
-đặc biệt ở t nhỏ, x_t bị kéo lệch không tự nhiên về phía z_prior.
-
-YÊU CẦU SỬA:
-1. Tìm nơi z_prior được tạo ra (từ popularity hoặc user-history, trước khi 
-   đưa vào interpolation x_t).
-2. Thêm bước rescale z_prior NGAY SAU khi tạo, TRƯỚC khi dùng trong x_t:
+   # Trong training loop, ngay trước khi combine loss, với mỗi modality:
+   with torch.no_grad():
+       ratio = diff_loss_image.mean() / (gc_loss_image.mean() + 1e-8)
+       if self.gc_scale_ema_image is None:
+           self.gc_scale_ema_image = ratio
+       else:
+           self.gc_scale_ema_image = (self.ema_decay * self.gc_scale_ema_image 
+                                       + (1 - self.ema_decay) * ratio)
    
-   scale_factor = x1.norm(dim=-1).mean() / z_prior.norm(dim=-1).mean()
-   z_prior = z_prior * scale_factor
-   
-   Tính scale_factor một lần trên tập train (hoặc một batch lớn đại diện), 
-   lưu lại làm hằng số cố định — KHÔNG tính lại mỗi batch (tránh scale factor 
-   dao động giữa các batch gây bất ổn training).
-3. Thêm assertion/log ngay sau bước rescale: in ra 
-   z_prior.norm(dim=-1).mean() và x1.norm(dim=-1).mean() mỗi vài trăm step 
-   đầu tiên, để xác nhận hai giá trị này gần nhau (~cùng bậc độ lớn) trong 
-   suốt quá trình train, không chỉ lúc khởi tạo.
+   gc_loss_image_scaled = gc_loss_image.mean() * self.gc_scale_ema_image
+   loss_image = diff_loss_image.mean() + gc_loss_image_scaled * args.e_loss
 
-VERIFY SAU KHI SỬA:
-In lại đúng bảng "[x1 vs z_prior norm]" như debug script cũ. Tiêu chí đạt: 
-tỷ lệ x1.norm.mean() / z_prior.norm.mean() nằm trong khoảng [0.9, 1.1] 
-(gần 1:1), thay vì ~2.6 như hiện tại.
+   (Lặp lại tương tự cho text, và audio nếu dataset là tiktok)
 
-=====================================================================
-TASK 3: Thêm logging diff_loss/gc_loss theo bucket t — TRÊN CHECKPOINT 
-ĐÃ TRAIN THẬT, không phải random init
-=====================================================================
+3. Sau khi normalize, gc_loss_scaled sẽ ~cùng bậc với diff_loss trước khi nhân 
+   e_loss — nghĩa là e_loss giờ mới thực sự đóng vai trò "trọng số tương đối" 
+   như thiết kế ban đầu, thay vì phải gánh luôn việc bù chênh lệch scale.
 
-VẤN ĐỀ:
-Cần biết liệu hệ số (1-t) nhân với v_pred trong công thức reconstruct 
-x_hat1 = x_t + (1-t)*v_pred có khuếch đại lỗi ở vùng t nhỏ hay không, 
-NHƯNG phải đo trên model đã train vài epoch với dữ liệu thật — đo trên 
-random-init weight sẽ cho kết quả không phản ánh hành vi thật.
-
-YÊU CẦU THÊM:
-1. Trong training loop (Main.py hoặc nơi tính diff_loss/gc_loss mỗi step), 
-   thêm một dict tích lũy theo bucket t:
-   
-   t_buckets = [(0.0,0.2), (0.2,0.4), (0.4,0.6), (0.6,0.8), (0.8,1.0)]
-   bucket_stats = {b: {'diff_loss': [], 'gc_loss': [], 'n': 0} for b in t_buckets}
-   
-2. Mỗi step, với t đã sample cho batch đó, gán từng sample vào đúng bucket 
-   (dùng t.item() cho từng sample trong batch, không phải t trung bình cả batch), 
-   append giá trị diff_loss và gc_loss (per-sample, TRƯỚC khi .mean() qua batch) 
-   vào đúng bucket.
-3. Sau mỗi epoch (không phải mỗi step — tránh log quá nhiều), in ra:
-   - mean, std của diff_loss và gc_loss từng bucket
-   - tỷ lệ gc_loss/diff_loss từng bucket
-   - so sánh với epoch trước để thấy xu hướng theo thời gian train
-4. Format log giống hệt bảng "[diff_loss vs gc_loss by t bucket]" cũ để 
-   dễ so sánh trực tiếp, nhưng thêm cột epoch:
-   
-   Epoch {e} | t in [0.0,0.2]: n=..., diff_loss(mean=...,std=...), 
-   gc_loss(mean=...,std=...), gc/diff=...
-   
-5. QUAN TRỌNG: log này phải chạy trên model đang train thật (weight cập nhật 
-   dần qua epoch), KHÔNG phải script diagnostic riêng với random weight.
+4. QUAN TRỌNG: dùng .detach()/no_grad() khi tính ratio — KHÔNG để gradient chảy 
+   qua phép tính EMA ratio, chỉ dùng nó như một hệ số scale cố định tại mỗi step.
 
 VERIFY:
-Chạy training thật vài epoch (5-10 epoch đủ để thấy xu hướng), xem log in ra 
-mỗi epoch. Điều cần quan sát: gc_loss ở bucket t nhỏ ([0.0,0.2]) có giảm chậm 
-hơn / giữ mức cao hơn đáng kể so với bucket t lớn ([0.8,1.0]) hay không, khi 
-train tiến triển qua các epoch. Nếu có, đó là bằng chứng cho thấy cần thêm 
-weighting theo t vào gc_loss (việc này CHƯA cần làm ngay, chỉ cần log để 
-xác nhận trước).
+Log ra mỗi epoch: giá trị self.gc_scale_ema_image/text (để theo dõi nó ổn định 
+dần theo thời gian, không dao động mạnh), và giá trị 
+gc_loss_scaled*e_loss so với diff_loss — hai giá trị này nên cùng bậc độ lớn 
+(tỷ lệ trong khoảng 0.1x - 10x), không còn chênh lệch 1000-8000 lần như trước.
+
+=====================================================================
+TASK 5: Retune e_loss sau khi normalize
+=====================================================================
+
+YÊU CẦU:
+Sau khi Task 4 xong, giá trị e_loss=0.01 hiện tại không còn ý nghĩa cũ (nó được 
+chọn để bù scale, giờ scale đã được EMA xử lý). Chạy lại training với vài giá 
+trị e_loss khác nhau: thử e_loss ∈ {0.1, 0.5, 1.0, 2.0}, giữ nguyên mọi 
+hyperparameter khác, so sánh Recall@20/NDCG@20 để chọn giá trị tốt nhất.
+KHÔNG cần sửa code cho task này, chỉ cần chạy lại Main.py với --e_loss khác nhau.
+
+=====================================================================
+TASK 6: Thêm logging magnitude của v_pred theo bucket t
+=====================================================================
+
+VẤN ĐỀ:
+Cần xác nhận giả thuyết: v_pred (velocity dự đoán) có magnitude bùng nổ bất 
+thường ở vùng t gần 1, do thiếu gradient signal hiệu quả ở vùng này khi hệ số 
+(1-t) trong công thức reconstruct quá nhỏ.
+
+YÊU CẦU THÊM:
+1. Trong đúng vị trí đã có bucket-t logging cho diff_loss/gc_loss (Task 3 cũ), 
+   thêm tracking cho ||v_pred|| (norm theo chiều cuối, tức theo item_dim) mỗi 
+   sample, gán vào cùng 5 bucket t: [(0.0,0.2), (0.2,0.4), (0.4,0.6), (0.6,0.8), 
+   (0.8,1.0)].
+
+2. Sau mỗi epoch, in thêm cột v_pred_norm (mean, std) cho từng bucket, cùng 
+   format với log hiện tại:
+
+   Epoch {e} | t in [0.0,0.2]: n=..., diff_loss(...), gc_loss(...), gc/diff=..., 
+   v_pred_norm(mean=...,std=...)
+
+3. Làm việc này cho cả image và text (và audio nếu tiktok).
+
+VERIFY:
+Chạy training vài epoch sau khi đã áp Task 4+5. Quan sát: v_pred_norm ở bucket 
+[0.8,1.0] có cao bất thường so với các bucket khác không (ví dụ cao hơn 
+2-3 lần so với bucket [0.0,0.2])? Nếu sau khi normalize gc_loss (Task 4) mà 
+pattern này biến mất hoặc giảm hẳn, điều đó xác nhận nguyên nhân là do gradient 
+signal yếu ở vùng t→1 (đã được Task 4 khắc phục gián tiếp). Nếu vẫn còn rõ rệt, 
+cần xem xét thêm việc thêm gradient clipping cho v_pred hoặc weighting loss 
+theo t (đã đề cập ở lần trước, chưa cần làm ngay).
 
 =====================================================================
 LƯU Ý CHUNG:
-- Làm TASK 1 và TASK 2 trước, train lại từ đầu, RỒI mới bật logging TASK 3 
-  để đo trên phiên bản đã fix — không đo TASK 3 trên model còn bug của TASK 1/2.
-- Sau khi cả 3 xong, so sánh Recall@20/NDCG@20 với con số DiffMM gốc và với 
-  con số 0.02% thấp hơn trước đây, để biết 2 fix này có đóng góp gì không.
+- Làm Task 4 trước, train lại, kiểm tra xem diff_loss có giảm rõ rệt hơn theo 
+  epoch không (so với chỉ giảm ~10% như hiện tại) — đây là tín hiệu quan trọng 
+  nhất cho biết velocity field đã thực sự được học.
+- Sau đó làm Task 5 (retune e_loss) để tìm giá trị tối ưu.
+- Task 6 (logging v_pred) có thể làm song song, không phụ thuộc thứ tự.
+- So sánh Recall@20/NDCG@20 cuối cùng với: (a) DiffMM gốc, (b) kết quả trước 
+  khi sửa Task 4/5 (Recall≈0.0946 đỉnh, ~0.092-0.094 plateau) — để biết việc 
+  rebalance loss có thực sự giúp vượt qua plateau hiện tại hay không.
 =====================================================================

@@ -420,7 +420,7 @@ class ConditionalFlowMatching(nn.Module):
 			'z_norm': self.tensor_stats(z_norm)
 		}
 
-	def training_losses(self, model, x_start, itmEmbeds, batch_index, model_feats, return_stats=False, return_t=False):
+	def training_losses(self, model, x_start, itmEmbeds, batch_index, model_feats, return_stats=False, return_t=False, return_v_norm=False):
 		batch_size = x_start.size(0)
 
 		t = torch.rand(batch_size, device=x_start.device)
@@ -431,6 +431,8 @@ class ConditionalFlowMatching(nn.Module):
 		v_target = x_start - z_prior
 
 		diff_loss = self.mean_flat((v_pred - v_target) ** 2)
+		if return_v_norm:
+			v_pred_norm = v_pred.detach().reshape(v_pred.shape[0], -1).norm(dim=1)
 
 		t_view = t
 		while len(t_view.shape) < len(x_start.shape):
@@ -443,12 +445,21 @@ class ConditionalFlowMatching(nn.Module):
 		gc_loss = self.mean_flat((usr_model_embeds - usr_id_embeds) ** 2)
 
 		if return_stats:
+			ret = [diff_loss, gc_loss, self.flow_stats(x_start, z_prior, x_t, v_target, t)]
 			if return_t:
-				return diff_loss, gc_loss, self.flow_stats(x_start, z_prior, x_t, v_target, t), t
-			return diff_loss, gc_loss, self.flow_stats(x_start, z_prior, x_t, v_target, t)
+				ret.append(t)
+			if return_v_norm:
+				ret.append(v_pred_norm)
+			return tuple(ret)
+
+		if return_t and return_v_norm:
+			return diff_loss, gc_loss, t, v_pred_norm
 
 		if return_t:
 			return diff_loss, gc_loss, t
+
+		if return_v_norm:
+			return diff_loss, gc_loss, v_pred_norm
 
 		return diff_loss, gc_loss
 
