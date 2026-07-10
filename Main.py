@@ -127,15 +127,21 @@ class Coach:
 				'gc_sq_sum': 0.0,
 				'v_norm_sum': 0.0,
 				'v_norm_sq_sum': 0.0,
+				'v_target_norm_sum': 0.0,
+				'v_target_norm_sq_sum': 0.0,
+				'cos_sim_sum': 0.0,
+				'cos_sim_sq_sum': 0.0,
 				'n': 0
 			}
 		return stats
 
-	def updateBucketStats(self, bucket_stats, t, diff_loss, gc_loss, v_pred_norm):
+	def updateBucketStats(self, bucket_stats, t, diff_loss, gc_loss, v_pred_norm, v_target_norm, cos_sim):
 		t = t.detach()
 		diff_loss = diff_loss.detach()
 		gc_loss = gc_loss.detach()
 		v_pred_norm = v_pred_norm.detach()
+		v_target_norm = v_target_norm.detach()
+		cos_sim = cos_sim.detach()
 		for start, end in self.t_buckets:
 			if end == 1.0:
 				mask = (t >= start) & (t <= end)
@@ -147,6 +153,8 @@ class Coach:
 			diff_bucket = diff_loss[mask].float()
 			gc_bucket = gc_loss[mask].float()
 			v_norm_bucket = v_pred_norm[mask].float()
+			v_target_norm_bucket = v_target_norm[mask].float()
+			cos_sim_bucket = cos_sim[mask].float()
 			stat = bucket_stats[(start, end)]
 			stat['diff_sum'] += diff_bucket.sum().item()
 			stat['diff_sq_sum'] += (diff_bucket * diff_bucket).sum().item()
@@ -154,6 +162,10 @@ class Coach:
 			stat['gc_sq_sum'] += (gc_bucket * gc_bucket).sum().item()
 			stat['v_norm_sum'] += v_norm_bucket.sum().item()
 			stat['v_norm_sq_sum'] += (v_norm_bucket * v_norm_bucket).sum().item()
+			stat['v_target_norm_sum'] += v_target_norm_bucket.sum().item()
+			stat['v_target_norm_sq_sum'] += (v_target_norm_bucket * v_target_norm_bucket).sum().item()
+			stat['cos_sim_sum'] += cos_sim_bucket.sum().item()
+			stat['cos_sim_sq_sum'] += (cos_sim_bucket * cos_sim_bucket).sum().item()
 			stat['n'] += n
 
 	def summarizeBucketStats(self, bucket_stats):
@@ -166,9 +178,13 @@ class Coach:
 			diff_mean = stat['diff_sum'] / n
 			gc_mean = stat['gc_sum'] / n
 			v_norm_mean = stat['v_norm_sum'] / n
+			v_target_norm_mean = stat['v_target_norm_sum'] / n
+			cos_sim_mean = stat['cos_sim_sum'] / n
 			diff_var = max(stat['diff_sq_sum'] / n - diff_mean * diff_mean, 0.0)
 			gc_var = max(stat['gc_sq_sum'] / n - gc_mean * gc_mean, 0.0)
 			v_norm_var = max(stat['v_norm_sq_sum'] / n - v_norm_mean * v_norm_mean, 0.0)
+			v_target_norm_var = max(stat['v_target_norm_sq_sum'] / n - v_target_norm_mean * v_target_norm_mean, 0.0)
+			cos_sim_var = max(stat['cos_sim_sq_sum'] / n - cos_sim_mean * cos_sim_mean, 0.0)
 			summary[bucket] = {
 				'n': n,
 				'diff_mean': diff_mean,
@@ -177,6 +193,10 @@ class Coach:
 				'gc_std': gc_var ** 0.5,
 				'v_norm_mean': v_norm_mean,
 				'v_norm_std': v_norm_var ** 0.5,
+				'v_target_norm_mean': v_target_norm_mean,
+				'v_target_norm_std': v_target_norm_var ** 0.5,
+				'cos_sim_mean': cos_sim_mean,
+				'cos_sim_std': cos_sim_var ** 0.5,
 				'ratio': gc_mean / max(diff_mean, 1e-12)
 			}
 		return summary
@@ -202,7 +222,9 @@ class Coach:
 				'diff_loss(mean=%.8f,std=%.8f), '
 				'gc_loss(mean=%.8f,std=%.8f), '
 				'gc/diff=%.8f, '
+				'cos_sim(mean=%.8f,std=%.8f), '
 				'v_pred_norm(mean=%.8f,std=%.8f), '
+				'v_target_norm(mean=%.8f,std=%.8f), '
 				'delta_vs_prev(diff=%.8f,gc=%.8f)' % (
 					epoch,
 					start,
@@ -213,8 +235,12 @@ class Coach:
 					stat['gc_mean'],
 					stat['gc_std'],
 					stat['ratio'],
+					stat['cos_sim_mean'],
+					stat['cos_sim_std'],
 					stat['v_norm_mean'],
 					stat['v_norm_std'],
+					stat['v_target_norm_mean'],
+					stat['v_target_norm_std'],
 					diff_delta,
 					gc_delta
 				),
@@ -386,21 +412,21 @@ class Coach:
 			return_stats = return_flow_stats or return_norm_stats
 
 			if return_stats:
-				diff_loss_image, gc_loss_image, flow_stats_image, t_image, v_pred_norm_image = self.diffusion_model.training_losses(self.denoise_model_image, batch_item, iEmbeds, batch_index, image_feats, return_stats=True, return_t=True, return_v_norm=True)
-				diff_loss_text, gc_loss_text, flow_stats_text, t_text, v_pred_norm_text = self.diffusion_model.training_losses(self.denoise_model_text, batch_item, iEmbeds, batch_index, text_feats, return_stats=True, return_t=True, return_v_norm=True)
+				diff_loss_image, gc_loss_image, flow_stats_image, t_image, v_pred_norm_image, v_target_norm_image, cos_sim_image = self.diffusion_model.training_losses(self.denoise_model_image, batch_item, iEmbeds, batch_index, image_feats, return_stats=True, return_t=True, return_v_norm=True, return_v_target_norm=True, return_cos_sim=True)
+				diff_loss_text, gc_loss_text, flow_stats_text, t_text, v_pred_norm_text, v_target_norm_text, cos_sim_text = self.diffusion_model.training_losses(self.denoise_model_text, batch_item, iEmbeds, batch_index, text_feats, return_stats=True, return_t=True, return_v_norm=True, return_v_target_norm=True, return_cos_sim=True)
 			else:
-				diff_loss_image, gc_loss_image, t_image, v_pred_norm_image = self.diffusion_model.training_losses(self.denoise_model_image, batch_item, iEmbeds, batch_index, image_feats, return_t=True, return_v_norm=True)
-				diff_loss_text, gc_loss_text, t_text, v_pred_norm_text = self.diffusion_model.training_losses(self.denoise_model_text, batch_item, iEmbeds, batch_index, text_feats, return_t=True, return_v_norm=True)
+				diff_loss_image, gc_loss_image, t_image, v_pred_norm_image, v_target_norm_image, cos_sim_image = self.diffusion_model.training_losses(self.denoise_model_image, batch_item, iEmbeds, batch_index, image_feats, return_t=True, return_v_norm=True, return_v_target_norm=True, return_cos_sim=True)
+				diff_loss_text, gc_loss_text, t_text, v_pred_norm_text, v_target_norm_text, cos_sim_text = self.diffusion_model.training_losses(self.denoise_model_text, batch_item, iEmbeds, batch_index, text_feats, return_t=True, return_v_norm=True, return_v_target_norm=True, return_cos_sim=True)
 			if args.data == 'tiktok':
 				if return_stats:
-					diff_loss_audio, gc_loss_audio, flow_stats_audio, t_audio, v_pred_norm_audio = self.diffusion_model.training_losses(self.denoise_model_audio, batch_item, iEmbeds, batch_index, audio_feats, return_stats=True, return_t=True, return_v_norm=True)
+					diff_loss_audio, gc_loss_audio, flow_stats_audio, t_audio, v_pred_norm_audio, v_target_norm_audio, cos_sim_audio = self.diffusion_model.training_losses(self.denoise_model_audio, batch_item, iEmbeds, batch_index, audio_feats, return_stats=True, return_t=True, return_v_norm=True, return_v_target_norm=True, return_cos_sim=True)
 				else:
-					diff_loss_audio, gc_loss_audio, t_audio, v_pred_norm_audio = self.diffusion_model.training_losses(self.denoise_model_audio, batch_item, iEmbeds, batch_index, audio_feats, return_t=True, return_v_norm=True)
+					diff_loss_audio, gc_loss_audio, t_audio, v_pred_norm_audio, v_target_norm_audio, cos_sim_audio = self.diffusion_model.training_losses(self.denoise_model_audio, batch_item, iEmbeds, batch_index, audio_feats, return_t=True, return_v_norm=True, return_v_target_norm=True, return_cos_sim=True)
 
-			self.updateBucketStats(bucket_stats_image, t_image, diff_loss_image, gc_loss_image, v_pred_norm_image)
-			self.updateBucketStats(bucket_stats_text, t_text, diff_loss_text, gc_loss_text, v_pred_norm_text)
+			self.updateBucketStats(bucket_stats_image, t_image, diff_loss_image, gc_loss_image, v_pred_norm_image, v_target_norm_image, cos_sim_image)
+			self.updateBucketStats(bucket_stats_text, t_text, diff_loss_text, gc_loss_text, v_pred_norm_text, v_target_norm_text, cos_sim_text)
 			if args.data == 'tiktok':
-				self.updateBucketStats(bucket_stats_audio, t_audio, diff_loss_audio, gc_loss_audio, v_pred_norm_audio)
+				self.updateBucketStats(bucket_stats_audio, t_audio, diff_loss_audio, gc_loss_audio, v_pred_norm_audio, v_target_norm_audio, cos_sim_audio)
 
 			loss_image, _, weighted_gc_scaled_image = self.combineFlowLoss('image', diff_loss_image, gc_loss_image)
 			loss_text, _, weighted_gc_scaled_text = self.combineFlowLoss('text', diff_loss_text, gc_loss_text)

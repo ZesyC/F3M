@@ -420,7 +420,7 @@ class ConditionalFlowMatching(nn.Module):
 			'z_norm': self.tensor_stats(z_norm)
 		}
 
-	def training_losses(self, model, x_start, itmEmbeds, batch_index, model_feats, return_stats=False, return_t=False, return_v_norm=False):
+	def training_losses(self, model, x_start, itmEmbeds, batch_index, model_feats, return_stats=False, return_t=False, return_v_norm=False, return_v_target_norm=False, return_cos_sim=False):
 		batch_size = x_start.size(0)
 
 		t = torch.rand(batch_size, device=x_start.device)
@@ -431,8 +431,16 @@ class ConditionalFlowMatching(nn.Module):
 		v_target = x_start - z_prior
 
 		diff_loss = self.mean_flat((v_pred - v_target) ** 2)
-		if return_v_norm:
-			v_pred_norm = v_pred.detach().reshape(v_pred.shape[0], -1).norm(dim=1)
+		if return_v_norm or return_v_target_norm or return_cos_sim:
+			with torch.no_grad():
+				v_pred_flat = v_pred.detach().reshape(v_pred.shape[0], -1)
+				v_target_flat = v_target.detach().reshape(v_target.shape[0], -1)
+				if return_v_norm:
+					v_pred_norm = v_pred_flat.norm(dim=1)
+				if return_v_target_norm:
+					v_target_norm = v_target_flat.norm(dim=1)
+				if return_cos_sim:
+					cos_sim = F.cosine_similarity(v_pred_flat, v_target_flat, dim=-1)
 
 		t_view = t
 		while len(t_view.shape) < len(x_start.shape):
@@ -450,16 +458,23 @@ class ConditionalFlowMatching(nn.Module):
 				ret.append(t)
 			if return_v_norm:
 				ret.append(v_pred_norm)
+			if return_v_target_norm:
+				ret.append(v_target_norm)
+			if return_cos_sim:
+				ret.append(cos_sim)
 			return tuple(ret)
 
-		if return_t and return_v_norm:
-			return diff_loss, gc_loss, t, v_pred_norm
-
+		ret = [diff_loss, gc_loss]
 		if return_t:
-			return diff_loss, gc_loss, t
-
+			ret.append(t)
 		if return_v_norm:
-			return diff_loss, gc_loss, v_pred_norm
+			ret.append(v_pred_norm)
+		if return_v_target_norm:
+			ret.append(v_target_norm)
+		if return_cos_sim:
+			ret.append(cos_sim)
+		if len(ret) > 2:
+			return tuple(ret)
 
 		return diff_loss, gc_loss
 
